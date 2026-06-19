@@ -194,6 +194,14 @@ var roughMode = false;
 var ensureNeeded = true;
 var persistStatus = 'checking'; // 'on' | 'best-effort' | 'checking'
 
+// --- API key: stored under its OWN key, never inside `state`, so serialize()/export
+// --- can never carry it. No key set => app runs pure-deterministic, no model calls.
+var APIKEY_STORE='cityDailyLoop.apiKey';
+var apiKey='';
+function loadApiKey(){ try{ apiKey=window.localStorage.getItem(APIKEY_STORE)||''; }catch(e){ apiKey=''; } }
+function setApiKey(v){ apiKey=(v||'').trim();
+  try{ if(apiKey) window.localStorage.setItem(APIKEY_STORE,apiKey); else window.localStorage.removeItem(APIKEY_STORE); }catch(e){} }
+
 // Ask Chrome to mark this origin persistent so it survives storage pressure.
 // HTTPS-only; harmless no-op where unsupported. Export remains the real backstop
 // for the cases this can't cover (uninstall, manual "clear data", new device).
@@ -224,7 +232,7 @@ function capture(){ var el=document.getElementById('cap'); var v=(el&&el.value||
   state=addTask(state,v,Date.now()); el.value=''; saveState(); render(); el.focus(); }
 function take(){ commit(takeCurrent); }
 function back(){ commit(putBack); ensureSurface(); saveState(); render(); }
-function pass(){ state=passCurrent(state,Date.now()); ensureSurface(); saveState(); render(); }
+function pass(){ state=passCurrent(state,Date.now()); ensureSurface(); saveState(); render(); maybeModel(null); }
 function done(){ state=completeCurrent(state,Date.now()); ensureSurface(); saveState(); render(); }
 function toggleRough(){ roughMode=!roughMode; state=commitSurface(state,Date.now(),roughMode); saveState(); render(); }
 function takeSpecific(id){ state=Object.assign({},state,{current:{taskId:id,reason:'oldest',taken:true}}); view='home'; saveState(); render(); }
@@ -256,6 +264,116 @@ function importData(){
     r.readAsText(f); };
   inp.click();
 }
+
+/* ============================================================
+   v2 intelligence layer — model only ever REPLACES a deterministic
+   pick, after an interaction, and only on valid + in-time output.
+   Every reason is validated true before it can reach the screen.
+   Platform values verified live against Anthropic docs June 19 2026.
+   ============================================================ */
+var API_URL='https://api.anthropic.com/v1/messages';
+var MODEL_ID='claude-haiku-4-5-20251001';
+var ANTHROPIC_VERSION='2023-06-01';
+var MODEL_TIMEOUT_MS=3000;
+var modelToken=0; // guards against a stale async response overwriting a newer surface
+
+var SELECTION_POLICY="You're given a few candidate tasks; pick the single best one to surface right now and classify the reason. Optimize for what the user can actually act on in their current situation: if statedContext is present, first narrow to tasks they could realistically do where they are, with the time and tools they named; within that set \u2014 or the whole list if no context was given or nothing fits \u2014 prefer a task with a deadline inside the window (soonest first), otherwise the oldest. Pick exactly one, only from the provided ids. Classify with the single most specific reason that is true of your pick given only the data provided; never assert a reason the data doesn't support. You are ranking tasks and have no information about the user \u2014 you need none.";
+
+var SELECT_TASK_TOOL={name:'select_task',description:'Choose exactly one task to surface and classify the reason.',
+  input_schema:{type:'object',properties:{
+    id:{type:'string',description:'id of the chosen task; MUST be one of the provided candidate ids'},
+    reason_code:{type:'string',enum:['oldest','deadline','fits-context']}
+  },required:['id','reason_code']}};
+
+function timeOfDayLabel(now){var h=new Date(now).getHours();return h<12?'morning':h<18?'afternoon':'evening';}
+
+// Allow-list ONLY. Logistics, never psychology. Nothing personal can cross the wire even
+// if it exists on the task object — this builder only ever reads these fields.
+function buildPayload(s,now,statedContext){
+  var pool=surfaceablePool(s,now);
+  var candidates=pool.map(function(t){return {
+    id:t.id, text:t.text,
+    ageDays:Math.max(0,Math.round((now-t.createdAt)/86400000)),
+    deadlineInDays:(t.deadline!=null)?daysUntil(t.deadline,now):null
+  };});
+  var ctx=(statedContext!=null&&String(statedContext).trim()!=='')?String(statedContext).trim():null;
+  return {candidates:candidates, statedContext:ctx, timeOfDay:timeOfDayLabel(now), dayMode:'normal'};
+}
+
+// §10 validation + oldest hardening. ANY failure => keep the deterministic pick.
+function validatePick(parsed,payload){
+  if(!parsed||typeof parsed!=='object')return false;
+  var ids=payload.candidates.map(function(c){return c.id;});
+  var idx=ids.indexOf(parsed.id);
+  if(idx<0)return false;                                                  // rule 1: real id
+  if(['oldest','deadline','fits-context'].indexOf(parsed.reason_code)<0)return false; // rule 2: enum
+  var c=payload.candidates[idx];
+  if(parsed.reason_code==='deadline'){                                    // rule 3: real in-window deadline (overdue ok)
+    if(c.deadlineInDays==null||c.deadlineInDays>DEADLINE_WINDOW_DAYS)return false;
+  }
+  if(parsed.reason_code==='fits-context'){                                // rule 4: context actually sent
+    if(payload.statedContext==null)return false;
+  }
+  if(parsed.reason_code==='oldest'){                                      // rule 5 (hardening): chosen really is among the oldest
+    var maxAge=Math.max.apply(null,payload.candidates.map(function(x){return x.ageDays;}));
+    if(c.ageDays!==maxAge)return false;
+  }
+  return true;
+}
+
+// item 4 (Architect-ratified): size leads. A time/effort cue => "Fits the time you've got";
+// otherwise a doability read => "Doable right where you are". One clause, never compounded.
+function fitsContextString(statedContext){
+  if(statedContext && /(\d+\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours)\b|\bquick\b|\bbefore\b|\bby\b|\bsoon\b|\bfast\b)/i.test(statedContext))
+    return "Fits the time you've got";
+  return "Doable right where you are";
+}
+
+function modelPick(payload){
+  var ctrl=new AbortController();
+  var timer=setTimeout(function(){ctrl.abort();},MODEL_TIMEOUT_MS);
+  var body={model:MODEL_ID,max_tokens:256,system:SELECTION_POLICY,
+    messages:[{role:'user',content:JSON.stringify(payload)}],
+    tools:[SELECT_TASK_TOOL],tool_choice:{type:'tool',name:'select_task'}}; // forced; thinking OFF (incompatible)
+  return fetch(API_URL,{method:'POST',headers:{
+      'x-api-key':apiKey,'anthropic-version':ANTHROPIC_VERSION,'content-type':'application/json',
+      'anthropic-dangerous-direct-browser-access':'true'
+    },body:JSON.stringify(body),signal:ctrl.signal})
+    .then(function(r){return r.json();})
+    .then(function(data){clearTimeout(timer);
+      var blocks=(data&&data.content)||[];
+      for(var i=0;i<blocks.length;i++){ var b=blocks[i];
+        if(b && b.type==='tool_use' && b.name==='select_task') return b.input; }
+      return null;
+    })
+    .catch(function(){clearTimeout(timer);return null;}); // offline / abort / timeout / malformed => null
+}
+
+// Fired ONLY after an interaction (pass / stated-context). Never first paint, never rough day.
+// A deterministic pick is already on screen; this may upgrade it, or silently leave it.
+function maybeModel(statedContext){
+  if(!apiKey||roughMode) return;                                          // no key or rough => deterministic stays
+  if(typeof navigator!=='undefined' && navigator.onLine===false) return;  // offline => deterministic stays
+  var now=Date.now();
+  var payload=buildPayload(state,now,statedContext);
+  if(payload.candidates.length===0) return;
+  var token=++modelToken;
+  modelPick(payload).then(function(parsed){
+    if(token!==modelToken) return;                                        // a newer interaction superseded this
+    if(!state.current || state.current.taken || state.current.rough) return; // user moved on
+    if(!parsed || !validatePick(parsed,payload)) return;                  // invalid => keep deterministic
+    var task=state.tasks.find(function(t){return t.id===parsed.id;});
+    if(!task) return;
+    var reasonText=(parsed.reason_code==='fits-context')
+      ? fitsContextString(payload.statedContext)
+      : reasonString(parsed.reason_code,task,now);
+    state=Object.assign({},state,{current:{taskId:parsed.id,reason:parsed.reason_code,reasonText:reasonText,taken:false}});
+    saveState(); render();
+  });
+}
+function ctxSubmit(){ var el=document.getElementById('ctx'); var v=(el&&el.value||'').trim(); if(!v)return; maybeModel(v); }
+function saveKey(){ var el=document.getElementById('apikey'); if(!el)return; var v=(el.value||'').trim(); if(!v)return; setApiKey(v); render(); }
+function clearKey(){ setApiKey(''); render(); }
 
 /* ============================================================
    render
@@ -326,13 +444,19 @@ function renderHome(now){
       +'</div></div>';
   } else if(cur){
     var t2=state.tasks.find(function(x){return x.id===cur.taskId;});
-    h+='<div class="card"><p class="reason">'+esc(reasonString(cur.reason,t2,now))+'</p>'
+    h+='<div class="card"><p class="reason">'+esc(cur.reasonText||reasonString(cur.reason,t2,now))+'</p>'
       +'<p class="surface-text">'+esc(t2?t2.text:'')+'</p>'
       +'<div class="actions">'
       +'<button class="btn primary" onclick="take()">Take it</button>'
       +'<button class="btn" onclick="pass()">Pass</button>'
       +'<button class="btn ghost full" onclick="setView(\'look\')">Let me look</button>'
-      +'</div></div>';
+      +'</div>';
+    if(apiKey){
+      h+='<div class="capture" style="margin-top:10px">'
+        +'<input id="ctx" placeholder="Say where you are \u2014 e.g. out, 20 min, no laptop" autocomplete="off" '
+        +'onkeydown="if(event.key===\'Enter\')ctxSubmit()"><button class="add" onclick="ctxSubmit()">Find</button></div>';
+    }
+    h+='</div>';
   } else {
     var untriaged=state.tasks.filter(function(t){return !t.triaged;}).length;
     var msg;
@@ -441,11 +565,18 @@ function renderSheet(){
     +'Either way, export now and then so an uninstall, a phone swap, or clearing Chrome data never costs your day count.</p>'
     +'<button class="btn primary" onclick="exportData()">Export backup (.json)</button>'
     +'<button class="btn" onclick="importData()">Restore from backup</button>'
+    +'<label>Claude API key (optional \u2014 powers smarter picks)</label>'
+    +'<input id="apikey" type="password" autocomplete="off" placeholder="'+(apiKey?'\u2022\u2022\u2022\u2022 set \u2014 paste to replace':'sk-ant-\u2026')+'">'
+    +'<button class="btn" onclick="saveKey()">Save key</button>'
+    +(apiKey?'<button class="btn ghost" onclick="clearKey()">Remove key</button>':'')
+    +'<p>Stored only on this device, in its own slot \u2014 never included in your backup export. '
+    +'No key set means the loop runs fully on the deterministic floor; it just won\u2019t call the model.</p>'
     +'<label>Rough-day floor action</label>'
     +'<input id="floor" value="'+esc(state.roughFloor)+'" onchange="commit(function(s){return Object.assign({},s,{roughFloor:document.getElementById(\'floor\').value});})">'
     +'</div></div>';
 }
 
+loadApiKey();
 render();
 requestPersistence();
 </script>
