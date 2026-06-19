@@ -101,14 +101,17 @@
 /* ============================================================
    loop-core (inlined). Logic verified offline in node — 25/25.
    ============================================================ */
-var DEADLINE_WINDOW_DAYS = 3, SCHEMA_VERSION = 1;
+var DEADLINE_WINDOW_DAYS = 3, SCHEMA_VERSION = 2;
+// Sobriety anchor: local midnight Jan 14 2026. Month is 0-indexed (0 = January).
+// The headline number is whole calendar days from here — never completion-based.
+var SOBRIETY_ANCHOR = new Date(2026,0,14);
 
 function dayKey(ts){var d=new Date(ts);return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 function daysUntil(deadlineTs,nowTs){var s=function(ts){var d=new Date(ts);d.setHours(0,0,0,0);return d.getTime();};return Math.round((s(deadlineTs)-s(nowTs))/86400000);}
 function emptyState(now){return{v:SCHEMA_VERSION,startedAt:now,tasks:[],doneLog:{},passed:{day:null,ids:[]},current:null,
   roughFloor:'Do the one small thing you already know.'};}
 function passedIdsForToday(s,now){return s.passed&&s.passed.day===dayKey(now)?s.passed.ids:[];}
-function surfaceablePool(s,now){var p=passedIdsForToday(s,now);return s.tasks.filter(function(t){return !t.tooBig && p.indexOf(t.id)<0;});}
+function surfaceablePool(s,now){var p=passedIdsForToday(s,now);return s.tasks.filter(function(t){return t.triaged && !t.tooBig && p.indexOf(t.id)<0;});}
 function selectAction(s,now,rough){
   if(rough)return{rough:true};
   var pool=surfaceablePool(s,now); if(pool.length===0)return null;
@@ -126,9 +129,13 @@ function reasonString(reason,task,now){
   return '';
 }
 function addTask(s,text,now){var id='t_'+now.toString(36)+'_'+Math.random().toString(36).slice(2,7);
-  return Object.assign({},s,{tasks:s.tasks.concat([{id:id,text:text.trim(),createdAt:now,deadline:null,tooBig:false}])});}
+  return Object.assign({},s,{tasks:s.tasks.concat([{id:id,text:text.trim(),createdAt:now,deadline:null,tooBig:false,triaged:false}])});}
 function triageTask(s,id,patch){return Object.assign({},s,{tasks:s.tasks.map(function(t){return t.id===id?
-  Object.assign({},t,{deadline:patch.deadline===undefined?t.deadline:patch.deadline,tooBig:patch.tooBig===undefined?t.tooBig:patch.tooBig}):t;})});}
+  Object.assign({},t,{
+    deadline:patch.deadline===undefined?t.deadline:patch.deadline,
+    tooBig:patch.tooBig===undefined?t.tooBig:patch.tooBig,
+    triaged:patch.triaged===undefined?t.triaged:patch.triaged
+  }):t;})});}
 function deleteTask(s,id){return Object.assign({},s,{tasks:s.tasks.filter(function(t){return t.id!==id;})});}
 function commitSurface(s,now,rough){var sel=selectAction(s,now,rough);
   if(sel===null)return Object.assign({},s,{current:null});
@@ -143,11 +150,30 @@ function completeCurrent(s,now){if(!s.current||s.current.rough)return s;var id=s
   if(!task)return Object.assign({},s,{current:null});var today=dayKey(now);var entry={id:task.id,text:task.text,completedAt:now};
   var arr=s.doneLog[today]?s.doneLog[today].concat([entry]):[entry];var dl=Object.assign({},s.doneLog);dl[today]=arr;
   return Object.assign({},s,{tasks:s.tasks.filter(function(t){return t.id!==id;}),doneLog:dl,current:null});}
-function dayCount(s){return Object.keys(s.doneLog).filter(function(k){return s.doneLog[k]&&s.doneLog[k].length>0;}).length;}
+// Item 5: headline number is whole calendar days from the anchor, recomputed every
+// render, never completion-based, never +1. Survives a full storage wipe — it
+// regenerates from the clock. doneLog no longer drives this number.
+function dayCount(){
+  var a=new Date(SOBRIETY_ANCHOR.getFullYear(),SOBRIETY_ANCHOR.getMonth(),SOBRIETY_ANCHOR.getDate());
+  var n=new Date(); var t=new Date(n.getFullYear(),n.getMonth(),n.getDate());
+  return Math.round((t-a)/86400000);
+}
+// Item 6: the rough-day floor action is loggable — logging it meets today's bar.
+// No task is removed (there's no task behind the floor); it just records a completion.
+function completeRoughFloor(s,now){var today=dayKey(now);
+  var entry={id:'floor_'+now,text:s.roughFloor,completedAt:now,floor:true};
+  var arr=s.doneLog[today]?s.doneLog[today].concat([entry]):[entry];
+  var dl=Object.assign({},s.doneLog);dl[today]=arr;
+  return Object.assign({},s,{doneLog:dl});}
+// The bar is one completion. True once today has any logged entry (floor or normal).
+function isTodayComplete(s,now){var k=dayKey(now);return !!(s.doneLog[k]&&s.doneLog[k].length>0);}
+// Migration: existing tasks predate the triaged field. Grandfather them to triaged:true
+// so the live pile keeps surfacing — only NEW captures wait for triage.
+function migrateTask(t){return Object.assign({triaged:true,deadline:null,tooBig:false},t);}
 function serialize(s){return JSON.stringify(s);}
 function deserialize(json,now){if(!json)return emptyState(now);var p;try{p=JSON.parse(json);}catch(e){return emptyState(now);}
   if(!p||typeof p!=='object')return emptyState(now);var base=emptyState(now);
-  return Object.assign({},base,p,{passed:p.passed||base.passed,doneLog:p.doneLog||base.doneLog,tasks:Array.isArray(p.tasks)?p.tasks:base.tasks});}
+  return Object.assign({},base,p,{passed:p.passed||base.passed,doneLog:p.doneLog||base.doneLog,tasks:Array.isArray(p.tasks)?p.tasks.map(migrateTask):base.tasks});}
 
 /* ============================================================
    storage glue — synchronous localStorage, in-memory is truth
@@ -207,6 +233,12 @@ function setDeadlineDays(id,days){ var dl = days===null?null: (function(){var d=
   commit(function(s){return triageTask(s,id,{deadline:dl});}); }
 function toggleBig(id){ var t=state.tasks.find(function(x){return x.id===id;}); commit(function(s){return triageTask(s,id,{tooBig:!(t&&t.tooBig)});}); }
 function removeTask(id){ commit(function(s){return deleteTask(s,id);}); }
+function triageToPool(id){ state=triageTask(state,id,{triaged:true}); ensureSurface(); saveState(); render(); }
+// Break down KEEPS the parent (Architect-ratified). The step enters the pile as a new
+// untriaged capture; the original stays in the too-big area, intact, never deleted here.
+function breakDown(id){ var step=prompt('One small first step:'); if(step==null)return; step=step.trim(); if(!step)return;
+  state=addTask(state,step,Date.now()); saveState(); render(); }
+function floorDone(){ state=completeRoughFloor(state,Date.now()); saveState(); render(); }
 
 /* export / import — the data-integrity backstop */
 function exportData(){
@@ -237,7 +269,7 @@ function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;
 function render(){
   if(ensureNeeded){ ensureSurface(); ensureNeeded=false; saveState(); }
   var now=Date.now();
-  var c=dayCount(state);
+  var c=dayCount();
   var html='';
 
   // storage warning — directive, not mood
@@ -266,11 +298,24 @@ function render(){
 
 function renderHome(now){
   var h='';
+  var todayDone=isTodayComplete(state,now);
+
+  // Item 6: floor-met rest-state. States a fact, never a verdict. Absent when unmet (neutral).
+  if(todayDone){
+    h+='<div class="banner note">Floor\u2019s done. That\u2019s a full day on the board. '
+      +'Anything past here is extra \u2014 not the bar moving.</div>';
+  }
+
   var cur=state.current;
   if(cur && cur.rough){
     h+='<div class="card rough"><p class="reason">Rough day. One thing only.</p>'
       +'<p class="surface-text">'+esc(state.roughFloor)+'</p>'
-      +'<div class="actions"><button class="btn primary full" onclick="toggleRough()">Back to normal</button></div></div>';
+      +'<div class="actions">';
+    if(!todayDone){
+      h+='<button class="btn primary full" onclick="floorDone()">Mark the floor done</button>';
+    }
+    h+='<button class="btn ghost full" onclick="toggleRough()">Back to normal</button>'
+      +'</div></div>';
   } else if(cur && cur.taken){
     var t=state.tasks.find(function(x){return x.id===cur.taskId;});
     h+='<div class="card"><p class="reason">Doing now</p>'
@@ -289,9 +334,12 @@ function renderHome(now){
       +'<button class="btn ghost full" onclick="setView(\'look\')">Let me look</button>'
       +'</div></div>';
   } else {
-    h+='<div class="card"><div class="empty"><b>Nothing waiting.</b>'
-      +(dayCount(state)>0?'You\'ve logged today. Rest, or capture the next thing below.':'Capture something below to start.')
-      +'</div></div>';
+    var untriaged=state.tasks.filter(function(t){return !t.triaged;}).length;
+    var msg;
+    if(todayDone) msg='Nothing else waiting. Rest, or capture below.';
+    else if(untriaged>0) msg='Nothing in the pool yet \u2014 '+untriaged+' waiting to triage on the Pile.';
+    else msg='Capture something below to start.';
+    h+='<div class="card"><div class="empty"><b>Nothing waiting.</b>'+msg+'</div></div>';
   }
 
   h+='<div class="roughrow"><button class="'+(state.current&&state.current.rough?'on':'')+'" onclick="toggleRough()">'
@@ -302,27 +350,66 @@ function renderHome(now){
   return h;
 }
 
+function byAge(a,b){return a.createdAt-b.createdAt;}
+function deadlineMeta(t,now){if(t.deadline==null)return'';var n=daysUntil(t.deadline,now);return n<0?Math.abs(n)+'d overdue':n===0?'due today':'due in '+n+'d';}
+function captureRow(){return '<div class="capture" style="margin-top:16px"><input id="cap" placeholder="Capture a task\u2026" autocomplete="off" onkeydown="if(event.key===\'Enter\')capture()"><button class="add" onclick="capture()">Add</button></div>';}
+
 function renderLook(now){
   if(state.tasks.length===0)
-    return '<div class="empty"><b>The pile is empty.</b>Capture something on the Now screen.</div>'
-      +'<div class="capture"><input id="cap" placeholder="Capture a task\u2026" autocomplete="off" onkeydown="if(event.key===\'Enter\')capture()"><button class="add" onclick="capture()">Add</button></div>';
-  var sorted=state.tasks.slice().sort(function(a,b){return a.createdAt-b.createdAt;});
-  var h='<h2>The pile \u00b7 '+sorted.length+'</h2>';
-  sorted.forEach(function(t){
-    var meta=[];
-    if(t.deadline!=null){var n=daysUntil(t.deadline,now);meta.push(n<0?Math.abs(n)+'d overdue':n===0?'due today':'due in '+n+'d');}
-    h+='<div class="row"><div class="t">'+esc(t.text)
-      +'<div class="meta">'
-      +(t.tooBig?'<span class="pill big">too big</span> ':'')
-      +(t.deadline!=null?'<span class="pill">'+meta[0]+'</span> ':'')
-      +'</div></div>'
-      +'<button class="iconbtn" onclick="takeSpecific(\''+t.id+'\')" title="Do this">do</button>'
-      +'<button class="iconbtn" onclick="cycleDeadline(\''+t.id+'\')" title="Set deadline">\u23f1</button>'
-      +'<button class="iconbtn" onclick="toggleBig(\''+t.id+'\')" title="Too big">\u2702</button>'
-      +'<button class="iconbtn" onclick="removeTask(\''+t.id+'\')" title="Delete">\u00d7</button>'
-      +'</div>';
-  });
-  h+='<div class="capture" style="margin-top:16px"><input id="cap" placeholder="Capture a task\u2026" autocomplete="off" onkeydown="if(event.key===\'Enter\')capture()"><button class="add" onclick="capture()">Add</button></div>';
+    return '<div class="empty"><b>The pile is empty.</b>Capture something on the Now screen.</div>'+captureRow();
+
+  var untriaged=state.tasks.filter(function(t){return !t.triaged;}).sort(byAge);
+  var ready=state.tasks.filter(function(t){return t.triaged && !t.tooBig;}).sort(byAge);
+  var big=state.tasks.filter(function(t){return t.triaged && t.tooBig;}).sort(byAge);
+  var h='';
+
+  // Untriaged holding area — one action: Triage (optionally set deadline/too-big, then add to pool)
+  if(untriaged.length){
+    h+='<h2>Needs triage \u00b7 '+untriaged.length+'</h2>';
+    untriaged.forEach(function(t){
+      var m=deadlineMeta(t,now);
+      h+='<div class="row"><div class="t">'+esc(t.text)
+        +'<div class="meta">'
+        +(t.tooBig?'<span class="pill big">too big</span> ':'')
+        +(t.deadline!=null?'<span class="pill">'+m+'</span> ':'')
+        +'</div></div>'
+        +'<button class="iconbtn" onclick="cycleDeadline(\''+t.id+'\')" title="Set deadline">\u23f1</button>'
+        +'<button class="iconbtn" onclick="toggleBig(\''+t.id+'\')" title="Too big">\u2702</button>'
+        +'<button class="iconbtn" onclick="triageToPool(\''+t.id+'\')" title="Add to pool">\u2713</button>'
+        +'<button class="iconbtn" onclick="removeTask(\''+t.id+'\')" title="Delete">\u00d7</button>'
+        +'</div>';
+    });
+  }
+
+  // Surfaceable pool — the daily loop
+  if(ready.length){
+    h+='<h2>Ready \u00b7 '+ready.length+'</h2>';
+    ready.forEach(function(t){
+      var m=deadlineMeta(t,now);
+      h+='<div class="row"><div class="t">'+esc(t.text)
+        +'<div class="meta">'+(t.deadline!=null?'<span class="pill">'+m+'</span> ':'')+'</div></div>'
+        +'<button class="iconbtn" onclick="takeSpecific(\''+t.id+'\')" title="Do this">do</button>'
+        +'<button class="iconbtn" onclick="cycleDeadline(\''+t.id+'\')" title="Set deadline">\u23f1</button>'
+        +'<button class="iconbtn" onclick="toggleBig(\''+t.id+'\')" title="Too big">\u2702</button>'
+        +'<button class="iconbtn" onclick="removeTask(\''+t.id+'\')" title="Delete">\u00d7</button>'
+        +'</div>';
+    });
+  }
+
+  // Too-big holding area — one action: Break down. Parent is KEPT, never deleted by break-down.
+  if(big.length){
+    h+='<h2>Too big \u00b7 '+big.length+'</h2>';
+    big.forEach(function(t){
+      h+='<div class="row"><div class="t">'+esc(t.text)
+        +'<div class="meta"><span class="pill big">too big</span></div></div>'
+        +'<button class="iconbtn" onclick="breakDown(\''+t.id+'\')" title="Break off one step">step</button>'
+        +'<button class="iconbtn" onclick="toggleBig(\''+t.id+'\')" title="Not too big">\u21a9</button>'
+        +'<button class="iconbtn" onclick="removeTask(\''+t.id+'\')" title="Delete">\u00d7</button>'
+        +'</div>';
+    });
+  }
+
+  h+=captureRow();
   return h;
 }
 
