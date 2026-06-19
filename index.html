@@ -91,6 +91,9 @@
   .sheet textarea{width:100%;min-height:120px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:#fff;font:13px/1.4 ui-monospace,monospace}
   .closebar{display:flex;justify-content:flex-end}
   .closebar button{padding:8px 12px;color:var(--muted);min-height:44px}
+
+  /* build/version stamp (debug aid) */
+  .ver{text-align:center;color:var(--muted);font-size:11px;margin-top:22px;opacity:.7;font-variant-numeric:tabular-nums}
 </style>
 </head>
 <body>
@@ -102,6 +105,7 @@
    loop-core (inlined). Logic verified offline in node — 25/25.
    ============================================================ */
 var DEADLINE_WINDOW_DAYS = 3, SCHEMA_VERSION = 2;
+var BUILD = 'v2 \u00b7 2026-06-19b \u00b7 model-path'; // bump this each iteration so the footer shows what's live
 // Sobriety anchor: local midnight Jan 14 2026. Month is 0-indexed (0 = January).
 // The headline number is whole calendar days from here — never completion-based.
 var SOBRIETY_ANCHOR = new Date(2026,0,14);
@@ -409,6 +413,8 @@ function render(){
   else html+=renderDone();
 
   if(sheetOpen) html+=renderSheet();
+
+  html+='<div class="ver">'+esc(BUILD)+'</div>';
 
   document.getElementById('app').innerHTML=html;
   var cap=document.getElementById('cap'); // keep focus stable if present
