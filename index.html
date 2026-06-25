@@ -94,6 +94,19 @@
 
   /* build/version stamp (debug aid) */
   .ver{text-align:center;color:var(--muted);font-size:11px;margin-top:22px;opacity:.7;font-variant-numeric:tabular-nums}
+
+  /* keystone — domain routing */
+  .pill.dom{background:#eef0ea;color:#3f5d3a}
+  .route{background:#fafaf8;border:1px solid var(--line);border-radius:14px;padding:14px;margin:2px 0 14px}
+  .routelabel{font-size:12px;color:var(--muted);margin-bottom:8px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px}
+  .chip{min-height:var(--tap);padding:0 16px;border:1px solid var(--line);border-radius:999px;background:#fff;font-size:14px;font-weight:550;color:var(--ink)}
+  .chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  .pp{white-space:pre-wrap;word-break:break-word;background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px;margin:12px 0 10px;font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink)}
+  .routeactions{display:flex;align-items:center;gap:12px;margin-bottom:8px;flex-wrap:wrap}
+  .routeactions .btn{width:auto;padding:0 18px}
+  .dest{font-size:13px;color:var(--muted)}
+  .route .btn.done{width:100%;margin-top:4px}
 </style>
 </head>
 <body>
@@ -105,7 +118,7 @@
    loop-core (inlined). Logic verified offline in node — 25/25.
    ============================================================ */
 var DEADLINE_WINDOW_DAYS = 3, SCHEMA_VERSION = 2;
-var BUILD = 'v2 \u00b7 2026-06-19b \u00b7 model-path'; // bump this each iteration so the footer shows what's live
+var BUILD = 'v2.1 \u00b7 2026-06-24 \u00b7 keystone'; // bump this each iteration so the footer shows what's live
 // Sobriety anchor: local midnight Jan 14 2026. Month is 0-indexed (0 = January).
 // The headline number is whole calendar days from here — never completion-based.
 var SOBRIETY_ANCHOR = new Date(2026,0,14);
@@ -133,7 +146,7 @@ function reasonString(reason,task,now){
   return '';
 }
 function addTask(s,text,now){var id='t_'+now.toString(36)+'_'+Math.random().toString(36).slice(2,7);
-  return Object.assign({},s,{tasks:s.tasks.concat([{id:id,text:text.trim(),createdAt:now,deadline:null,tooBig:false,triaged:false}])});}
+  return Object.assign({},s,{tasks:s.tasks.concat([{id:id,text:text.trim(),createdAt:now,deadline:null,tooBig:false,triaged:false,domain:null}])});}
 function triageTask(s,id,patch){return Object.assign({},s,{tasks:s.tasks.map(function(t){return t.id===id?
   Object.assign({},t,{
     deadline:patch.deadline===undefined?t.deadline:patch.deadline,
@@ -173,7 +186,7 @@ function completeRoughFloor(s,now){var today=dayKey(now);
 function isTodayComplete(s,now){var k=dayKey(now);return !!(s.doneLog[k]&&s.doneLog[k].length>0);}
 // Migration: existing tasks predate the triaged field. Grandfather them to triaged:true
 // so the live pile keeps surfacing — only NEW captures wait for triage.
-function migrateTask(t){return Object.assign({triaged:true,deadline:null,tooBig:false},t);}
+function migrateTask(t){return Object.assign({triaged:true,deadline:null,tooBig:false,domain:null},t);}
 function serialize(s){return JSON.stringify(s);}
 function deserialize(json,now){if(!json)return emptyState(now);var p;try{p=JSON.parse(json);}catch(e){return emptyState(now);}
   if(!p||typeof p!=='object')return emptyState(now);var base=emptyState(now);
@@ -442,12 +455,14 @@ function renderHome(now){
       +'</div></div>';
   } else if(cur && cur.taken){
     var t=state.tasks.find(function(x){return x.id===cur.taskId;});
-    h+='<div class="card"><p class="reason">Doing now</p>'
+    h+='<div class="card"><p class="reason">Doing now'+(t&&t.domain?' \u00b7 '+esc(t.domain):'')+'</p>'
       +'<p class="surface-text">'+esc(t?t.text:'')+'</p>'
       +'<div class="actions">'
       +'<button class="btn primary full" onclick="done()">Mark it done</button>'
       +'<button class="btn ghost full" onclick="back()">Put it back</button>'
-      +'</div></div>';
+      +'</div>';
+    if(t){ h+=(routingFor===t.id?routePanel(t):'<button class="btn ghost full" onclick="openRoute(\''+t.id+'\')" style="margin-top:10px">Route to a domain \u2192</button>'); }
+    h+='</div>';
   } else if(cur){
     var t2=state.tasks.find(function(x){return x.id===cur.taskId;});
     h+='<div class="card"><p class="reason">'+esc(cur.reasonText||reasonString(cur.reason,t2,now))+'</p>'
@@ -484,6 +499,65 @@ function byAge(a,b){return a.createdAt-b.createdAt;}
 function deadlineMeta(t,now){if(t.deadline==null)return'';var n=daysUntil(t.deadline,now);return n<0?Math.abs(n)+'d overdue':n===0?'due today':'due in '+n+'d';}
 function captureRow(){return '<div class="capture" style="margin-top:16px"><input id="cap" placeholder="Capture a task\u2026" autocomplete="off" onkeydown="if(event.key===\'Enter\')capture()"><button class="add" onclick="capture()">Add</button></div>';}
 
+/* ============================================================
+   KEYSTONE — manual domain tag + deterministic paste-prompt.
+   Model-free by design: domain is a one-tap manual pick; the prompt
+   is a template assembled from fields already on the task. Works
+   with no key, offline, every time. The silent categorizer sweep
+   layers on LATER as the tap-saver; it does not exist yet and
+   nothing here depends on it. The prompt is generated regardless of
+   whether the domain project exists — it just needs the project live
+   to have somewhere to land.
+   ============================================================ */
+var DOMAINS=['Work','Soccer','Financial','Household']; // LOCKED byte-identical: project name = tag = enum. Household != Family.
+var routingFor=null;   // task id whose route panel is open (transient UI, not persisted)
+var copiedFor=null;    // task id whose prompt was just copied (transient UI)
+
+function setDomain(id,domain){
+  state=Object.assign({},state,{tasks:state.tasks.map(function(t){return t.id===id?Object.assign({},t,{domain:domain}):t;})});
+  copiedFor=null; saveState(); render();
+}
+function openRoute(id){ routingFor=id; copiedFor=null; render(); }
+function closeRoute(){ routingFor=null; copiedFor=null; render(); }
+
+// Lean by design: the domain project's open-ritual already reads canonical and
+// reports freshness + log-top on orient, so the prompt does NOT re-carry context.
+function buildPastePrompt(t){
+  var shape = t.tooBig ? 'break it down (flagged too big to start in one go)' : 'do it';
+  var lines=['['+t.domain+' \u2014 from Daily Loop]','Task: '+t.text,'Shape: '+shape];
+  if(t.deadline!=null){var n=daysUntil(t.deadline,Date.now());
+    lines.push('Timing: '+(n<0?'overdue by '+Math.abs(n)+'d':n===0?'due today':n===1?'due tomorrow':'due in '+n+'d'));}
+  lines.push('Starting this now in '+t.domain+'.');
+  return lines.join('\n');
+}
+function legacyCopy(text){
+  try{var ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';
+    document.body.appendChild(ta);ta.focus();ta.select();document.execCommand('copy');document.body.removeChild(ta);}catch(e){}
+}
+function copyPrompt(id){
+  var t=state.tasks.find(function(x){return x.id===id;}); if(!t||!t.domain)return;
+  var text=buildPastePrompt(t);
+  function ok(){ copiedFor=id; render(); }
+  try{
+    if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(text).then(ok,function(){legacyCopy(text);ok();}); }
+    else { legacyCopy(text); ok(); }
+  }catch(e){ legacyCopy(text); ok(); }
+}
+function domainPill(t){ return t.domain?'<span class="pill dom">'+esc(t.domain)+'</span> ':''; }
+function routeBtn(t){ return '<button class="iconbtn" onclick="openRoute(\''+t.id+'\')" title="Route to a domain">\u2192</button>'; }
+function routePanel(t){
+  var h='<div class="route"><div class="routelabel">Route to a domain</div><div class="chips">';
+  DOMAINS.forEach(function(d){ h+='<button class="chip'+(t.domain===d?' on':'')+'" onclick="setDomain(\''+t.id+'\',\''+d+'\')">'+d+'</button>'; });
+  h+='</div>';
+  if(t.domain){
+    h+='<pre class="pp">'+esc(buildPastePrompt(t))+'</pre>'
+      +'<div class="routeactions"><button class="btn primary" onclick="copyPrompt(\''+t.id+'\')">'+(copiedFor===t.id?'Copied \u2713':'Copy prompt')+'</button>'
+      +'<span class="dest">Paste into your '+esc(t.domain)+' project</span></div>';
+  }
+  h+='<button class="btn ghost done" onclick="closeRoute()">Done</button></div>';
+  return h;
+}
+
 function renderLook(now){
   if(state.tasks.length===0)
     return '<div class="empty"><b>The pile is empty.</b>Capture something on the Now screen.</div>'+captureRow();
@@ -500,14 +574,16 @@ function renderLook(now){
       var m=deadlineMeta(t,now);
       h+='<div class="row"><div class="t">'+esc(t.text)
         +'<div class="meta">'
+        +domainPill(t)
         +(t.tooBig?'<span class="pill big">too big</span> ':'')
         +(t.deadline!=null?'<span class="pill">'+m+'</span> ':'')
         +'</div></div>'
         +'<button class="iconbtn" onclick="cycleDeadline(\''+t.id+'\')" title="Set deadline">\u23f1</button>'
         +'<button class="iconbtn" onclick="toggleBig(\''+t.id+'\')" title="Too big">\u2702</button>'
         +'<button class="iconbtn" onclick="triageToPool(\''+t.id+'\')" title="Add to pool">\u2713</button>'
+        +routeBtn(t)
         +'<button class="iconbtn" onclick="removeTask(\''+t.id+'\')" title="Delete">\u00d7</button>'
-        +'</div>';
+        +'</div>'+(routingFor===t.id?routePanel(t):'');
     });
   }
 
@@ -517,12 +593,13 @@ function renderLook(now){
     ready.forEach(function(t){
       var m=deadlineMeta(t,now);
       h+='<div class="row"><div class="t">'+esc(t.text)
-        +'<div class="meta">'+(t.deadline!=null?'<span class="pill">'+m+'</span> ':'')+'</div></div>'
+        +'<div class="meta">'+domainPill(t)+(t.deadline!=null?'<span class="pill">'+m+'</span> ':'')+'</div></div>'
         +'<button class="iconbtn" onclick="takeSpecific(\''+t.id+'\')" title="Do this">do</button>'
         +'<button class="iconbtn" onclick="cycleDeadline(\''+t.id+'\')" title="Set deadline">\u23f1</button>'
         +'<button class="iconbtn" onclick="toggleBig(\''+t.id+'\')" title="Too big">\u2702</button>'
+        +routeBtn(t)
         +'<button class="iconbtn" onclick="removeTask(\''+t.id+'\')" title="Delete">\u00d7</button>'
-        +'</div>';
+        +'</div>'+(routingFor===t.id?routePanel(t):'');
     });
   }
 
@@ -531,11 +608,12 @@ function renderLook(now){
     h+='<h2>Too big \u00b7 '+big.length+'</h2>';
     big.forEach(function(t){
       h+='<div class="row"><div class="t">'+esc(t.text)
-        +'<div class="meta"><span class="pill big">too big</span></div></div>'
+        +'<div class="meta">'+domainPill(t)+'<span class="pill big">too big</span></div></div>'
         +'<button class="iconbtn" onclick="breakDown(\''+t.id+'\')" title="Break off one step">step</button>'
         +'<button class="iconbtn" onclick="toggleBig(\''+t.id+'\')" title="Not too big">\u21a9</button>'
+        +routeBtn(t)
         +'<button class="iconbtn" onclick="removeTask(\''+t.id+'\')" title="Delete">\u00d7</button>'
-        +'</div>';
+        +'</div>'+(routingFor===t.id?routePanel(t):'');
     });
   }
 
