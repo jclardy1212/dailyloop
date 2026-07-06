@@ -127,7 +127,7 @@
    loop-core (inlined). Logic verified offline in node — 25/25.
    ============================================================ */
 var DEADLINE_WINDOW_DAYS = 3, SCHEMA_VERSION = 2;
-var BUILD = 'v2.2 \u00b7 2026-07-06 \u00b7 smart-capture'; // bump this each iteration so the footer shows what's live
+var BUILD = 'v2.3 \u00b7 2026-07-06 \u00b7 hotfix-dangling-current'; // bump this each iteration so the footer shows what's live
 // Sobriety anchor: local midnight Jan 14 2026. Month is 0-indexed (0 = January).
 // The headline number is whole calendar days from here — never completion-based.
 var SOBRIETY_ANCHOR = new Date(2026,0,14);
@@ -162,7 +162,11 @@ function triageTask(s,id,patch){return Object.assign({},s,{tasks:s.tasks.map(fun
     tooBig:patch.tooBig===undefined?t.tooBig:patch.tooBig,
     triaged:patch.triaged===undefined?t.triaged:patch.triaged
   }):t;})});}
-function deleteTask(s,id){return Object.assign({},s,{tasks:s.tasks.filter(function(t){return t.id!==id;})});}
+function deleteTask(s,id){var next=Object.assign({},s,{tasks:s.tasks.filter(function(t){return t.id!==id;})});
+  // v2.3: never leave `current` pointing at a deleted task — the dangling pointer
+  // persists to storage and crashes every subsequent render (found live, Day 173).
+  if(next.current&&!next.current.rough&&next.current.taskId===id){next=Object.assign({},next,{current:null});}
+  return next;}
 function commitSurface(s,now,rough){var sel=selectAction(s,now,rough);
   if(sel===null)return Object.assign({},s,{current:null});
   if(sel.rough)return Object.assign({},s,{current:{rough:true}});
@@ -247,6 +251,11 @@ function requestPersistence(){
 
 function ensureSurface(){
   if(roughMode){ state=commitSurface(state,Date.now(),true); return; }
+  // v2.3 self-heal: a persisted `current` that references a missing task (poisoned by
+  // the pre-fix delete path) is discarded and recomputed — cures the device on load.
+  if(state.current&&!state.current.rough&&!state.tasks.some(function(t){return t.id===state.current.taskId;})){
+    state=Object.assign({},state,{current:null});
+  }
   if(!state.current){ state=commitSurface(state,Date.now(),false); }
 }
 
@@ -588,6 +597,10 @@ function renderHome(now){
     h+='</div>';
   } else if(cur){
     var t2=state.tasks.find(function(x){return x.id===cur.taskId;});
+    if(!t2){ // v2.3 guard: never crash the render on a dangling pointer — heal and re-render
+      state=Object.assign({},state,{current:null}); ensureSurface(); saveState();
+      return renderHome(now);
+    }
     h+='<div class="card"><p class="reason">'+esc(cur.reasonText||reasonString(cur.reason,t2,now))+'</p>'
       +'<p class="surface-text">'+esc(t2?t2.text:'')+'</p>'
       +'<div class="actions">'
