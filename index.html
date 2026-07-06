@@ -92,6 +92,15 @@
   .closebar{display:flex;justify-content:flex-end}
   .closebar button{padding:8px 12px;color:var(--muted);min-height:44px}
 
+  /* smart-capture proposal row — a quiet suggestion, never a demand */
+  .proprow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;margin:0 0 10px;
+    background:var(--accent-soft);border-radius:10px;font-size:13px;color:var(--accent)}
+  .proprow.pending{background:transparent;color:var(--muted);padding:2px 10px 8px;font-style:italic}
+  .propbits{flex:1;min-width:120px;line-height:1.4}
+  .propbtn{min-height:40px;padding:0 12px;border-radius:8px;font-size:13px;font-weight:550;color:var(--accent)}
+  .propbtn.yes{background:#fff;border:1px solid var(--accent)}
+  .propbtn:active{transform:translateY(1px)}
+
   /* build/version stamp (debug aid) */
   .ver{text-align:center;color:var(--muted);font-size:11px;margin-top:22px;opacity:.7;font-variant-numeric:tabular-nums}
 
@@ -118,7 +127,7 @@
    loop-core (inlined). Logic verified offline in node — 25/25.
    ============================================================ */
 var DEADLINE_WINDOW_DAYS = 3, SCHEMA_VERSION = 2;
-var BUILD = 'v2.1 \u00b7 2026-06-24 \u00b7 keystone'; // bump this each iteration so the footer shows what's live
+var BUILD = 'v2.2 \u00b7 2026-07-06 \u00b7 smart-capture'; // bump this each iteration so the footer shows what's live
 // Sobriety anchor: local midnight Jan 14 2026. Month is 0-indexed (0 = January).
 // The headline number is whole calendar days from here — never completion-based.
 var SOBRIETY_ANCHOR = new Date(2026,0,14);
@@ -246,7 +255,10 @@ function ensureSurface(){
    ============================================================ */
 function commit(mut){ state=mut(state); saveState(); render(); }
 function capture(){ var el=document.getElementById('cap'); var v=(el&&el.value||'').trim(); if(!v)return;
-  state=addTask(state,v,Date.now()); el.value=''; saveState(); render(); el.focus(); }
+  state=addTask(state,v,Date.now()); el.value=''; saveState(); render(); el.focus();
+  // smart capture: propose a triage for what was just typed (silent no-op without a key)
+  var newest=state.tasks[state.tasks.length-1];
+  if(newest && typeof maybePropose==='function') maybePropose(newest.id); }
 function take(){ commit(takeCurrent); }
 function back(){ commit(putBack); ensureSurface(); saveState(); render(); }
 function pass(){ state=passCurrent(state,Date.now()); ensureSurface(); saveState(); render(); maybeModel(null); }
@@ -388,6 +400,115 @@ function maybeModel(statedContext){
     saveState(); render();
   });
 }
+/* ============================================================
+   v2.2 smart capture — the model PROPOSES a triage (domain /
+   deadline / size / first step); the Mayor confirms with one tap.
+   Same doctrine as selection: fires only after an interaction
+   (the capture itself), proposals are transient UI (never
+   persisted), every field is validated true-by-construction, and
+   any failure means no chip ever appears — the manual triage flow
+   is the untouched deterministic floor.
+   ============================================================ */
+var TRIAGE_POLICY="You triage one freshly captured task for a personal task app. Given the task text, today's date and weekday, and the fixed list of life domains, propose: which domain it belongs to (only if the text clearly indicates one — otherwise null); a deadline as whole days from today (only if the text names or strongly implies real timing like a weekday, 'tomorrow', 'by Friday', 'before the trip' — otherwise null; resolve weekday names to the NEXT occurrence); whether it is too big to do in one sitting (a project, multi-step, or vague-large item); and if too big, one small concrete first step in plain words (otherwise null). Be conservative: null beats a guess. Never invent timing or a domain the text doesn't support.";
+
+var PROPOSE_TRIAGE_TOOL={name:'propose_triage',description:'Propose a triage for one captured task.',
+  input_schema:{type:'object',properties:{
+    domain:{type:['string','null'],enum:['Work','Soccer','Financial','Household',null],description:'one of the provided domains, or null if unclear'},
+    deadline_days:{type:['integer','null'],description:'whole days from today (0 = today); null if the text implies no real timing'},
+    too_big:{type:'boolean',description:'true if this cannot be done in one sitting'},
+    first_step:{type:['string','null'],description:'one small concrete first step; only when too_big, else null'}
+  },required:['domain','deadline_days','too_big','first_step']}};
+
+var proposals={};        // taskId -> validated proposal (transient UI state, never persisted)
+var proposalPending={};  // taskId -> true while a request is in flight (renders a quiet hint)
+
+function weekdayLabel(now){return ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][new Date(now).getDay()];}
+
+// Allow-list ONLY, same rule as selection: the task text the Mayor just typed, the date,
+// and the domain enum. Nothing else exists on the wire.
+function buildTriagePayload(t,now){
+  return {task:t.text, today:dayKey(now), weekday:weekdayLabel(now), domains:DOMAINS.slice()};
+}
+
+// True-by-construction: enum-checked domain, range-checked deadline, step only with too_big.
+function validateProposal(p){
+  if(!p||typeof p!=='object')return false;
+  if(p.domain!==null && DOMAINS.indexOf(p.domain)<0)return false;
+  if(p.deadline_days!==null){
+    if(typeof p.deadline_days!=='number'||p.deadline_days%1!==0)return false;
+    if(p.deadline_days<0||p.deadline_days>60)return false;
+  }
+  if(typeof p.too_big!=='boolean')return false;
+  if(p.first_step!==null && (typeof p.first_step!=='string'||!p.first_step.trim()))return false;
+  if(p.first_step!==null && !p.too_big)return false;
+  if(p.domain===null&&p.deadline_days===null&&!p.too_big)return false; // nothing proposed => no chip
+  return true;
+}
+
+function modelTriage(payload){
+  var ctrl=new AbortController();
+  var timer=setTimeout(function(){ctrl.abort();},MODEL_TIMEOUT_MS);
+  var body={model:MODEL_ID,max_tokens:300,system:TRIAGE_POLICY,
+    messages:[{role:'user',content:JSON.stringify(payload)}],
+    tools:[PROPOSE_TRIAGE_TOOL],tool_choice:{type:'tool',name:'propose_triage'}}; // forced; thinking OFF (incompatible)
+  return fetch(API_URL,{method:'POST',headers:{
+      'x-api-key':apiKey,'anthropic-version':ANTHROPIC_VERSION,'content-type':'application/json',
+      'anthropic-dangerous-direct-browser-access':'true'
+    },body:JSON.stringify(body),signal:ctrl.signal})
+    .then(function(r){return r.json();})
+    .then(function(data){clearTimeout(timer);
+      var blocks=(data&&data.content)||[];
+      for(var i=0;i<blocks.length;i++){ var b=blocks[i];
+        if(b && b.type==='tool_use' && b.name==='propose_triage') return b.input; }
+      return null;
+    })
+    .catch(function(){clearTimeout(timer);return null;});
+}
+
+// Fired from capture (a real interaction) or the per-row think button. Silent on any failure.
+function maybePropose(taskId){
+  if(!apiKey) return;
+  if(typeof navigator!=='undefined' && navigator.onLine===false) return;
+  var t=state.tasks.find(function(x){return x.id===taskId;});
+  if(!t||t.triaged) return;
+  proposalPending[taskId]=true;
+  modelTriage(buildTriagePayload(t,Date.now())).then(function(parsed){
+    delete proposalPending[taskId];
+    var still=state.tasks.find(function(x){return x.id===taskId;});
+    if(!still||still.triaged){ delete proposals[taskId]; render(); return; } // user moved on
+    if(!parsed||!validateProposal(parsed)){ render(); return; }             // invalid => no chip, floor stands
+    proposals[taskId]=parsed; render();
+  });
+}
+
+// One tap: apply the proposal and finish the triage. Too-big items land in the too-big
+// area with their first step added as a plain capture (no cascading proposals — the
+// step is small and obvious by construction). Parent is kept, per ratified behavior.
+function acceptProposal(id){
+  var p=proposals[id]; if(!p)return;
+  var t=state.tasks.find(function(x){return x.id===id;}); if(!t)return;
+  delete proposals[id];
+  var dl = p.deadline_days===null?null:(function(){var d=new Date();d.setHours(0,0,0,0);return d.getTime()+p.deadline_days*86400000;})();
+  state=triageTask(state,id,{deadline:dl,tooBig:p.too_big,triaged:true});
+  if(p.domain){ state=Object.assign({},state,{tasks:state.tasks.map(function(x){return x.id===id?Object.assign({},x,{domain:p.domain}):x;})}); }
+  if(p.too_big&&p.first_step){ state=addTask(state,p.first_step,Date.now()); }
+  ensureSurface(); saveState(); render();
+}
+function dismissProposal(id){ delete proposals[id]; render(); }
+
+// The chip row under an untriaged task: what the model proposes, stated plainly, two taps max.
+function proposalRow(t){
+  if(proposalPending[t.id]) return '<div class="proprow pending">thinking\u2026</div>';
+  var p=proposals[t.id]; if(!p)return '';
+  var bits=[];
+  if(p.domain)bits.push(esc(p.domain));
+  if(p.deadline_days!==null)bits.push(p.deadline_days===0?'due today':p.deadline_days===1?'due tomorrow':'due in '+p.deadline_days+'d');
+  if(p.too_big)bits.push('too big'+(p.first_step?' \u00b7 first step: \u201c'+esc(p.first_step)+'\u201d':''));
+  return '<div class="proprow"><span class="propbits">'+bits.join(' \u00b7 ')+'</span>'
+    +'<button class="propbtn yes" onclick="acceptProposal(\''+t.id+'\')">\u2713 Use it</button>'
+    +'<button class="propbtn" onclick="dismissProposal(\''+t.id+'\')">\u00d7</button></div>';
+}
+
 function ctxSubmit(){ var el=document.getElementById('ctx'); var v=(el&&el.value||'').trim(); if(!v)return; maybeModel(v); }
 function saveKey(){ var el=document.getElementById('apikey'); if(!el)return; var v=(el.value||'').trim(); if(!v)return; setApiKey(v); render(); }
 function clearKey(){ setApiKey(''); render(); }
@@ -413,7 +534,9 @@ function render(){
       +'Use Backup (top right) to keep your data, or open this in your normal browser tab.</div>';
   }
 
-  html+='<header><div class="count"><b>'+c+'</b><span>'+(c===1?'day logged':'days logged')+'</span></div>'
+  // Label matches the math: whole calendar days since the Jan 14 anchor. Never "logged" —
+  // the number is not earned from entries and never reads as one (Architect copy fix, Day 173).
+  html+='<header><div class="count"><b>'+c+'</b><span>'+(c===1?'day':'days')+' \u00b7 since Jan 14</span></div>'
     +'<div class="menu">'
     +'<button onclick="setView(\'home\')" aria-current="'+(view==='home')+'">Now</button>'
     +'<button onclick="setView(\'look\')" aria-current="'+(view==='look')+'">Pile</button>'
@@ -581,9 +704,10 @@ function renderLook(now){
         +'<button class="iconbtn" onclick="cycleDeadline(\''+t.id+'\')" title="Set deadline">\u23f1</button>'
         +'<button class="iconbtn" onclick="toggleBig(\''+t.id+'\')" title="Too big">\u2702</button>'
         +'<button class="iconbtn" onclick="triageToPool(\''+t.id+'\')" title="Add to pool">\u2713</button>'
+        +(apiKey&&!proposals[t.id]&&!proposalPending[t.id]?'<button class="iconbtn" onclick="maybePropose(\''+t.id+'\')" title="Propose a triage">\u2726</button>':'')
         +routeBtn(t)
         +'<button class="iconbtn" onclick="removeTask(\''+t.id+'\')" title="Delete">\u00d7</button>'
-        +'</div>'+(routingFor===t.id?routePanel(t):'');
+        +'</div>'+proposalRow(t)+(routingFor===t.id?routePanel(t):'');
     });
   }
 
@@ -654,7 +778,8 @@ function renderSheet(){
     +'<button class="btn" onclick="saveKey()">Save key</button>'
     +(apiKey?'<button class="btn ghost" onclick="clearKey()">Remove key</button>':'')
     +'<p>Stored only on this device, in its own slot \u2014 never included in your backup export. '
-    +'No key set means the loop runs fully on the deterministic floor; it just won\u2019t call the model.</p>'
+    +'No key set means the loop runs fully on the deterministic floor; it just won\u2019t call the model. '
+    +'Use a dedicated key with a small monthly spend cap (set both in the Anthropic console) so the worst case is capped and boring.</p>'
     +'<label>Rough-day floor action</label>'
     +'<input id="floor" value="'+esc(state.roughFloor)+'" onchange="commit(function(s){return Object.assign({},s,{roughFloor:document.getElementById(\'floor\').value});})">'
     +'</div></div>';
