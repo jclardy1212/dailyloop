@@ -135,7 +135,7 @@
    v2.4 adds the prepared-list import + the Day 191 Architect copy pass.
    ============================================================ */
 var DEADLINE_WINDOW_DAYS = 3, SCHEMA_VERSION = 2;
-var BUILD = 'v2.4 \u00b7 2026-07-24 \u00b7 prepared-list import + guardrail-3'; // bump this each iteration so the footer shows what's live
+var BUILD = 'v2.4.1 \u00b7 2026-07-24 \u00b7 import + guardrail-3 + too-big date'; // bump this each iteration so the footer shows what's live
 // Sobriety anchor: local midnight Jan 14 2026. Month is 0-indexed (0 = January).
 // The headline number is whole calendar days from here — never completion-based.
 var SOBRIETY_ANCHOR = new Date(2026,0,14);
@@ -923,11 +923,16 @@ function renderLook(now){
   }
 
   // Too-big holding area — one action: Break down. Parent is KEPT, never deleted by break-down.
+  // A parent stays out of the pool, but Guardrail 4 still applies: a real external date
+  // renders here or it renders nowhere at all. (Found live, Day 191 — CBLE exam, 96d out.)
   if(big.length){
     h+='<h2>Too big</h2>';
     big.forEach(function(t){
+      var mb=deadlineMeta(t,now);
       h+='<div class="row"><div class="t">'+esc(t.text)
-        +'<div class="meta">'+domainPill(t)+'<span class="pill big">too big</span></div></div>'
+        +'<div class="meta">'+domainPill(t)+'<span class="pill big">too big</span> '
+        +(t.deadline!=null?'<span class="pill">'+mb+'</span> ':'')
+        +'</div></div>'
         +'<button class="iconbtn" onclick="breakDown(\''+t.id+'\')" title="Break off one step">step</button>'
         +'<button class="iconbtn" onclick="toggleBig(\''+t.id+'\')" title="Not too big">\u21a9</button>'
         +routeBtn(t)
