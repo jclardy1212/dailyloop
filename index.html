@@ -84,6 +84,7 @@
   .sheet .panel{background:var(--paper);width:100%;max-width:520px;border-radius:18px 18px 0 0;
     padding:20px 18px calc(20px + env(safe-area-inset-bottom));max-height:86vh;overflow:auto}
   .sheet h3{margin:0 0 4px;font-size:17px}
+  .sheet h3.sec{margin-top:26px;padding-top:20px;border-top:1px solid var(--line)}
   .sheet p{color:var(--muted);font-size:14px;margin:0 0 16px}
   .sheet .btn{width:100%;margin-bottom:10px}
   .sheet label{display:block;font-size:13px;color:var(--muted);margin:14px 0 6px}
@@ -91,6 +92,12 @@
   .sheet textarea{width:100%;min-height:120px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:#fff;font:13px/1.4 ui-monospace,monospace}
   .closebar{display:flex;justify-content:flex-end}
   .closebar button{padding:8px 12px;color:var(--muted);min-height:44px}
+
+  /* import receipt — transient, describes the act just completed, gone on commit */
+  .receipt{background:var(--accent-soft);color:var(--accent);border-radius:10px;padding:10px 12px;
+    font-size:13px;margin:0 0 10px;line-height:1.45}
+  .receipt ul{margin:8px 0 0;padding-left:18px}
+  .receipt li{margin:2px 0;word-break:break-word}
 
   /* smart-capture proposal row — a quiet suggestion, never a demand */
   .proprow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;margin:0 0 10px;
@@ -125,9 +132,10 @@
 'use strict';
 /* ============================================================
    loop-core (inlined). Logic verified offline in node — 25/25.
+   v2.4 adds the prepared-list import + the Day 191 Architect copy pass.
    ============================================================ */
 var DEADLINE_WINDOW_DAYS = 3, SCHEMA_VERSION = 2;
-var BUILD = 'v2.3 \u00b7 2026-07-06 \u00b7 hotfix-dangling-current'; // bump this each iteration so the footer shows what's live
+var BUILD = 'v2.4 \u00b7 2026-07-24 \u00b7 prepared-list import + guardrail-3'; // bump this each iteration so the footer shows what's live
 // Sobriety anchor: local midnight Jan 14 2026. Month is 0-indexed (0 = January).
 // The headline number is whole calendar days from here — never completion-based.
 var SOBRIETY_ANCHOR = new Date(2026,0,14);
@@ -135,6 +143,7 @@ var SOBRIETY_ANCHOR = new Date(2026,0,14);
 function dayKey(ts){var d=new Date(ts);return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 function daysUntil(deadlineTs,nowTs){var s=function(ts){var d=new Date(ts);d.setHours(0,0,0,0);return d.getTime();};return Math.round((s(deadlineTs)-s(nowTs))/86400000);}
 function emptyState(now){return{v:SCHEMA_VERSION,startedAt:now,tasks:[],doneLog:{},passed:{day:null,ids:[]},current:null,
+  importedBatches:[],
   roughFloor:'Do the one small thing you already know.'};}
 function passedIdsForToday(s,now){return s.passed&&s.passed.day===dayKey(now)?s.passed.ids:[];}
 function surfaceablePool(s,now){var p=passedIdsForToday(s,now);return s.tasks.filter(function(t){return t.triaged && !t.tooBig && p.indexOf(t.id)<0;});}
@@ -147,8 +156,16 @@ function selectAction(s,now,rough){
   var oldest=pool.slice().sort(function(a,b){return a.createdAt-b.createdAt;})[0];
   return{taskId:oldest.id,reason:'oldest'};
 }
+// Architect ruling 5 (Day 191): suppress the age reason for anything under 24h old.
+// On a freshly loaded pool "it's been waiting the longest" is technically true and reads
+// as nonsense — which costs the true-by-construction property on the one day it matters
+// most (the witnessed first open). Suppress, never a second string to maintain.
+// Selection is untouched; only the rendered reason is withheld.
 function reasonString(reason,task,now){
-  if(reason==='oldest')return "it's been waiting the longest";
+  if(reason==='oldest'){
+    if(task && (now-task.createdAt) < 86400000) return '';
+    return "it's been waiting the longest";
+  }
   if(reason==='deadline'){var n=daysUntil(task.deadline,now);
     if(n<0)return 'this was due '+Math.abs(n)+' day'+(Math.abs(n)===1?'':'s')+' ago';
     if(n===0)return 'this is due today'; if(n===1)return 'due tomorrow'; return 'due in '+n+' days';}
@@ -183,6 +200,8 @@ function completeCurrent(s,now){if(!s.current||s.current.rough)return s;var id=s
 // Item 5: headline number is whole calendar days from the anchor, recomputed every
 // render, never completion-based, never +1. Survives a full storage wipe — it
 // regenerates from the clock. doneLog no longer drives this number.
+// Canon Day 191 (Card_DayCount_NotLosable): no surface may imply this can be lost,
+// spent, broken, restored, or backed up. A surface may state it; never put it at risk.
 function dayCount(){
   var a=new Date(SOBRIETY_ANCHOR.getFullYear(),SOBRIETY_ANCHOR.getMonth(),SOBRIETY_ANCHOR.getDate());
   var n=new Date(); var t=new Date(n.getFullYear(),n.getMonth(),n.getDate());
@@ -203,7 +222,9 @@ function migrateTask(t){return Object.assign({triaged:true,deadline:null,tooBig:
 function serialize(s){return JSON.stringify(s);}
 function deserialize(json,now){if(!json)return emptyState(now);var p;try{p=JSON.parse(json);}catch(e){return emptyState(now);}
   if(!p||typeof p!=='object')return emptyState(now);var base=emptyState(now);
-  return Object.assign({},base,p,{passed:p.passed||base.passed,doneLog:p.doneLog||base.doneLog,tasks:Array.isArray(p.tasks)?p.tasks.map(migrateTask):base.tasks});}
+  return Object.assign({},base,p,{passed:p.passed||base.passed,doneLog:p.doneLog||base.doneLog,
+    importedBatches:Array.isArray(p.importedBatches)?p.importedBatches:base.importedBatches,
+    tasks:Array.isArray(p.tasks)?p.tasks.map(migrateTask):base.tasks});}
 
 /* ============================================================
    storage glue — synchronous localStorage, in-memory is truth
@@ -297,10 +318,155 @@ function importData(){
   var inp=document.createElement('input'); inp.type='file'; inp.accept='application/json,.json';
   inp.onchange=function(){ var f=inp.files[0]; if(!f)return; var r=new FileReader();
     r.onload=function(){ var next=deserialize(r.result,Date.now());
-      if(!confirm('Replace everything on this device with the backup? Day count, tasks, and history will be overwritten.'))return;
+      // Canon Day 191: the day count is calendar math and cannot be overwritten by a
+      // restore. It never appears in this warning.
+      if(!confirm('Replace all tasks and history on this device with the backup?'))return;
       state=next; roughMode=false; state=commitSurface(state,Date.now(),false); saveState(); closeSheet(); render(); };
     r.readAsText(f); };
   inp.click();
+}
+
+/* ============================================================
+   v2.4 — LOAD A PREPARED LIST
+   One-time migration, Architect-approved-with-constraints (Day 191).
+   Deterministic by construction: no model, no network, no key needed.
+   The Hand triages upstream; this only parses and merges.
+
+   Guardrail 1 — lives behind Settings, never on the daily surface.
+   Guardrail 2 — anything that fails validation lands in the holding area
+                 untriaged, carrying whatever did parse. Nothing is ever
+                 dropped silently, on any path.
+   Guardrail 3 — the receipt is transient, counts up, describes the act
+                 just completed, and is gone on commit. Never standing state.
+   Guardrail 4 — a deadline is only ever what the line literally said.
+                 No relative language is interpreted, no date is invented.
+
+   Line shape (4 pipes, 5 fields, no quoting, no escaping):
+     text | domain | size | deadline | firststep
+   ============================================================ */
+var IMPORT_MAX_COMPOSED = 100;             // chars; heuristic guard for the 2-line cap at 21px
+var PREIMPORT_STORE = 'cityDailyLoop.preimport';
+var importText = '';                       // survives re-render; textarea value is re-emitted from here
+var importPreview = null;                  // transient parse result
+var importMsg = null;                      // transient one-line notice
+
+// Local-midnight from Y-M-D components. Deliberately NOT midnight + n*86400000 —
+// that drifts an hour across a DST boundary and lands a day early past Nov 1.
+function parseImportDate(s){
+  var m=/^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if(!m) return undefined;                                  // undefined = invalid; null = none given
+  var y=+m[1], mo=+m[2], d=+m[3];
+  var dt=new Date(y,mo-1,d);
+  if(dt.getFullYear()!==y||dt.getMonth()!==mo-1||dt.getDate()!==d) return undefined;
+  return dt.getTime();
+}
+// Case-forgiving, never guessing: an unrecognised domain is a validation failure,
+// not a silent null. Canonical casing is what gets stored.
+function canonicalDomain(s){
+  for(var i=0;i<DOMAINS.length;i++){ if(DOMAINS[i].toLowerCase()===s.toLowerCase()) return DOMAINS[i]; }
+  return undefined;
+}
+function parseImport(raw){
+  var lines=String(raw||'').split(/\r?\n/);
+  var batch=null, ready=[], holding=[];
+  for(var i=0;i<lines.length;i++){
+    var line=lines[i].trim();
+    if(!line) continue;
+    if(line.charAt(0)==='#'){
+      var bm=/^#\s*batch\b[:\s]*(.+)$/i.exec(line);
+      if(bm) batch=bm[1].trim();
+      continue;                                             // other # lines are comments
+    }
+    if(line.replace(/\|/g,'').trim()==='') continue;         // delimiters with no content
+    var parts=line.split('|');
+    if(parts.length!==5){ holding.push({text:line}); continue; }
+    var txt=parts[0].trim(), dom=parts[1].trim(), size=parts[2].trim().toLowerCase(),
+        dl=parts[3].trim(), step=parts[4].trim();
+    if(!txt){ holding.push({text:line}); continue; }
+
+    var domain=null;
+    if(dom){ domain=canonicalDomain(dom); if(domain===undefined){ holding.push({text:txt}); continue; } }
+
+    if(size==='') size='real';
+    if(['quick','real','big'].indexOf(size)<0){ holding.push({text:txt,domain:domain}); continue; }
+    var tooBig=(size==='big');
+
+    var deadline=null;
+    if(dl){ deadline=parseImportDate(dl); if(deadline===undefined){ holding.push({text:txt,domain:domain}); continue; } }
+
+    // Architect ruling 4: "— start by" for one-sitting items. For too-big items the app's
+    // own acceptProposal precedent governs — parent kept, step spawned as its own item.
+    var composed=txt, spawn=null;
+    if(step){
+      if(tooBig){ spawn=step; }
+      else{
+        var c=txt+' \u2014 start by '+step;
+        if(c.length>IMPORT_MAX_COMPOSED){ holding.push({text:txt,domain:domain}); continue; }
+        composed=c;
+      }
+    }
+    ready.push({text:composed,domain:domain,tooBig:tooBig,deadline:deadline,spawn:spawn});
+  }
+  return {batch:batch,ready:ready,holding:holding};
+}
+// createdAt staggers one second and runs BACKWARDS from now, so the collated order
+// becomes the surfacing order and nothing is stamped in the future.
+function buildImportTasks(parsed,base){
+  var specs=[];
+  parsed.ready.forEach(function(r){
+    specs.push({text:r.text,deadline:r.deadline,tooBig:r.tooBig,triaged:true,domain:r.domain});
+    if(r.spawn) specs.push({text:r.spawn,deadline:null,tooBig:false,triaged:true,domain:r.domain});
+  });
+  parsed.holding.forEach(function(h){
+    specs.push({text:h.text,deadline:null,tooBig:false,triaged:false,domain:h.domain||null});
+  });
+  var total=specs.length;
+  return specs.map(function(s,i){
+    var ts=base-(total-1-i)*1000;
+    return {id:'t_'+ts.toString(36)+'_'+Math.random().toString(36).slice(2,7),
+      text:s.text,createdAt:ts,deadline:s.deadline,tooBig:s.tooBig,triaged:s.triaged,domain:s.domain};
+  });
+}
+function importCounts(parsed){
+  var spawns=parsed.ready.filter(function(r){return !!r.spawn;}).length;
+  return {ready:parsed.ready.length+spawns, holding:parsed.holding.length};
+}
+function onImportInput(el){ importText=el.value; }
+function previewImport(){
+  var el=document.getElementById('importbox'); if(el) importText=el.value;
+  if(!String(importText).trim()){ importPreview=null; importMsg=null; render(); return; }
+  var p=parseImport(importText);
+  var already=(state.importedBatches||[]);
+  if(p.batch && already.indexOf(p.batch)>=0){
+    importPreview=null;
+    importMsg='Batch '+p.batch+' is already on this device. Nothing loaded.';
+    render(); return;
+  }
+  var c=importCounts(p);
+  if(c.ready+c.holding===0){ importPreview=null; importMsg='No lines found to load.'; render(); return; }
+  importPreview=p; importMsg=null; render();
+}
+function cancelImport(){ importPreview=null; importMsg=null; render(); }
+function commitImport(){
+  if(!importPreview) return;
+  // Snapshot first. Merge, never replace — the restore path above is the destructive one.
+  try{ window.localStorage.setItem(PREIMPORT_STORE, serialize(state)); }catch(e){}
+  var added=buildImportTasks(importPreview,Date.now());
+  var batches=(state.importedBatches||[]).slice();
+  if(importPreview.batch) batches.push(importPreview.batch);
+  state=Object.assign({},state,{tasks:state.tasks.concat(added),importedBatches:batches});
+  importPreview=null; importText=''; importMsg='Loaded. The list is on the Pile.';
+  ensureSurface(); saveState(); render();
+}
+function hasPreimportSnapshot(){ try{ return !!window.localStorage.getItem(PREIMPORT_STORE); }catch(e){ return false; } }
+function undoImport(){
+  var snap=null; try{ snap=window.localStorage.getItem(PREIMPORT_STORE); }catch(e){}
+  if(!snap) return;
+  if(!confirm('Undo the last load? Anything captured since the load will also be rolled back.')) return;
+  state=deserialize(snap,Date.now());
+  try{ window.localStorage.removeItem(PREIMPORT_STORE); }catch(e){}
+  importPreview=null; importMsg='Load undone.';
+  ensureSurface(); saveState(); render();
 }
 
 /* ============================================================
@@ -417,6 +583,9 @@ function maybeModel(statedContext){
    persisted), every field is validated true-by-construction, and
    any failure means no chip ever appears — the manual triage flow
    is the untouched deterministic floor.
+   NOTE (Day 191): deadline_days is capped at 60 by validateProposal,
+   so anything further out than ~2 months yields no chip at all. The
+   prepared-list import is the only path to a far-dated deadline.
    ============================================================ */
 var TRIAGE_POLICY="You triage one freshly captured task for a personal task app. Given the task text, today's date and weekday, and the fixed list of life domains, propose: which domain it belongs to (only if the text clearly indicates one — otherwise null); a deadline as whole days from today (only if the text names or strongly implies real timing like a weekday, 'tomorrow', 'by Friday', 'before the trip' — otherwise null; resolve weekday names to the NEXT occurrence); whether it is too big to do in one sitting (a project, multi-step, or vague-large item); and if too big, one small concrete first step in plain words (otherwise null). Be conservative: null beats a guess. Never invent timing or a domain the text doesn't support.";
 
@@ -527,7 +696,7 @@ function clearKey(){ setApiKey(''); render(); }
    ============================================================ */
 var sheetOpen=false;
 function openSheet(){sheetOpen=true;render();}
-function closeSheet(){sheetOpen=false;render();}
+function closeSheet(){sheetOpen=false;importPreview=null;importMsg=null;render();}
 
 function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 
@@ -601,7 +770,10 @@ function renderHome(now){
       state=Object.assign({},state,{current:null}); ensureSurface(); saveState();
       return renderHome(now);
     }
-    h+='<div class="card"><p class="reason">'+esc(cur.reasonText||reasonString(cur.reason,t2,now))+'</p>'
+    // Ruling 5: an empty reason renders no line at all, not an empty one.
+    var rtext=cur.reasonText||reasonString(cur.reason,t2,now);
+    h+='<div class="card">'
+      +(rtext?'<p class="reason">'+esc(rtext)+'</p>':'')
       +'<p class="surface-text">'+esc(t2?t2.text:'')+'</p>'
       +'<div class="actions">'
       +'<button class="btn primary" onclick="take()">Take it</button>'
@@ -615,12 +787,18 @@ function renderHome(now){
     }
     h+='</div>';
   } else {
+    // Guardrail 3 (Architect, Day 191): pointer, never quantity. No count — and no
+    // exposure framing either, which trades a denominator for a different bill.
+    // First render has to read as relief.
     var untriaged=state.tasks.filter(function(t){return !t.triaged;}).length;
-    var msg;
-    if(todayDone) msg='Nothing else waiting. Rest, or capture below.';
-    else if(untriaged>0) msg='Nothing in the pool yet \u2014 '+untriaged+' waiting to triage on the Pile.';
-    else msg='Capture something below to start.';
-    h+='<div class="card"><div class="empty"><b>Nothing waiting.</b>'+msg+'</div></div>';
+    if(todayDone){
+      h+='<div class="card"><div class="empty"><b>Nothing else waiting.</b>Rest, or capture below.</div></div>';
+    } else {
+      var msg = untriaged>0
+        ? 'Nothing in the pool yet \u2014 triage what\u2019s waiting.'
+        : 'Nothing in the pool yet \u2014 capture something and it lands here.';
+      h+='<div class="card"><div class="empty">'+msg+'</div></div>';
+    }
   }
 
   h+='<div class="roughrow"><button class="'+(state.current&&state.current.rough?'on':'')+'" onclick="toggleRough()">'
@@ -703,9 +881,13 @@ function renderLook(now){
   var big=state.tasks.filter(function(t){return t.triaged && t.tooBig;}).sort(byAge);
   var h='';
 
+  // Guardrail 3 (Architect, Day 191): bare headers, no standing counts. A count beside
+  // "Too big" is a shame ledger with a number on it. The Done log keeps its count —
+  // that one counts up and is the competence mirror's mechanism, not a denominator.
+
   // Untriaged holding area — one action: Triage (optionally set deadline/too-big, then add to pool)
   if(untriaged.length){
-    h+='<h2>Needs triage \u00b7 '+untriaged.length+'</h2>';
+    h+='<h2>Needs triage</h2>';
     untriaged.forEach(function(t){
       var m=deadlineMeta(t,now);
       h+='<div class="row"><div class="t">'+esc(t.text)
@@ -726,7 +908,7 @@ function renderLook(now){
 
   // Surfaceable pool — the daily loop
   if(ready.length){
-    h+='<h2>Ready \u00b7 '+ready.length+'</h2>';
+    h+='<h2>Ready</h2>';
     ready.forEach(function(t){
       var m=deadlineMeta(t,now);
       h+='<div class="row"><div class="t">'+esc(t.text)
@@ -742,7 +924,7 @@ function renderLook(now){
 
   // Too-big holding area — one action: Break down. Parent is KEPT, never deleted by break-down.
   if(big.length){
-    h+='<h2>Too big \u00b7 '+big.length+'</h2>';
+    h+='<h2>Too big</h2>';
     big.forEach(function(t){
       h+='<div class="row"><div class="t">'+esc(t.text)
         +'<div class="meta">'+domainPill(t)+'<span class="pill big">too big</span></div></div>'
@@ -778,14 +960,47 @@ function renderDone(){
   return h;
 }
 
+function renderImportSection(){
+  var h='<h3 class="sec">Load a prepared list</h3>'
+    +'<p>Prepared with the Hand. Day-to-day capture stays one at a time.</p>';
+
+  if(importMsg){ h+='<div class="receipt">'+esc(importMsg)+'</div>'; }
+
+  if(importPreview){
+    var c=importCounts(importPreview);
+    h+='<div class="receipt">'+c.ready+' ready to load \u00b7 '+c.holding+' to the holding area';
+    if(importPreview.holding.length){
+      h+='<ul>';
+      importPreview.holding.forEach(function(x){ h+='<li>'+esc(x.text)+'</li>'; });
+      h+='</ul>';
+    }
+    h+='</div>'
+      +'<button class="btn primary" onclick="commitImport()">Load</button>'
+      +'<button class="btn ghost" onclick="cancelImport()">Cancel</button>';
+  } else {
+    h+='<textarea id="importbox" placeholder="text | domain | size | deadline | first step" '
+      +'oninput="onImportInput(this)">'+esc(importText)+'</textarea>'
+      +'<button class="btn" onclick="previewImport()">Check the list</button>';
+  }
+
+  if(hasPreimportSnapshot()){
+    h+='<button class="btn ghost" onclick="undoImport()">Undo the last load</button>';
+  }
+  return h;
+}
+
 function renderSheet(){
   return '<div class="sheet" onclick="if(event.target===this)closeSheet()"><div class="panel">'
     +'<div class="closebar"><button onclick="closeSheet()">Close</button></div>'
     +'<h3>Backup</h3><p>This data lives only on this device. '
     +'Protected storage is <b>'+(persistStatus==='on'?'on — Chrome won\u2019t evict this':persistStatus==='best-effort'?'best-effort':'checking\u2026')+'</b>. '
-    +'Either way, export now and then so an uninstall, a phone swap, or clearing Chrome data never costs your day count.</p>'
+    +'Either way, export now and then so an uninstall or a phone swap never costs your tasks.</p>'
+    +'<p>Your day count isn\u2019t in here \u2014 it\u2019s calendar math from January 14. It can\u2019t be lost.</p>'
     +'<button class="btn primary" onclick="exportData()">Export backup (.json)</button>'
     +'<button class="btn" onclick="importData()">Restore from backup</button>'
+    +renderImportSection()
+    +'<h3 class="sec">Smart capture</h3>'
+    +'<p>Smart capture: '+(apiKey?'on':'off \u2014 capture still works, triage is manual.')+'</p>'
     +'<label>Claude API key (optional \u2014 powers smarter picks)</label>'
     +'<input id="apikey" type="password" autocomplete="off" placeholder="'+(apiKey?'\u2022\u2022\u2022\u2022 set \u2014 paste to replace':'sk-ant-\u2026')+'">'
     +'<button class="btn" onclick="saveKey()">Save key</button>'
